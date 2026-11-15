@@ -14105,7 +14105,19 @@ static void gp_trajectory_attempt(BOOL permitWrite) {
             char processPath[4096] = {0};
             int bytes = proc_pidpath(entries[i].pid, processPath, sizeof(processPath));
             if (bytes <= 0 || processPath[0] != '/') {
-                log_user("[GP-TRAJECTORY] Cannot establish executable path for PID %d; no write permitted.\n",
+                // Diagnostic only: log the kernel's vnode-based path when
+                // libproc is sandbox-blocked. NEVER use this fallback to
+                // authorize a write; bundle identity is still unverified.
+                char vnodePath[1024] = {0};
+                BOOL haveVnodePath = procmgr_exe_path_for_entry(
+                    entries[i].kproc, entries[i].pid, vnodePath, sizeof(vnodePath));
+                if (haveVnodePath)
+                    log_user("[GP-TRAJECTORY] PID %d kernel vnode path (UNVERIFIED): %s\n",
+                             entries[i].pid, vnodePath);
+                else
+                    log_user("[GP-TRAJECTORY] PID %d kernel vnode path unavailable.\n",
+                             entries[i].pid);
+                log_user("[GP-TRAJECTORY] proc_pidpath denied for PID %d; no write permitted.\n",
                          entries[i].pid);
                 matches = -1;
                 break;
