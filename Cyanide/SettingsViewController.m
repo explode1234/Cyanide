@@ -55,6 +55,7 @@
 #import <os/lock.h>
 
 #import <objc/runtime.h>
+#import <mach-o/loader.h>
 #import <objc/objc-sync.h>
 #import <sys/time.h>
 #import <sys/sysctl.h>
@@ -14192,6 +14193,280 @@ static void gp_trajectory_inspect_readonly(void) {
 // Experimental *live* GamePigeon memory inspection. No game-code writes.
 // Uses Cyanide's existing kernel VM-object mapping, which changes local
 // mapping bookkeeping and may destabilize the device even though read-only.
+// GP-META: bounded, read-only Mach-O / Objective-C metadata investigation.
+// These routines never run target code, open cross-app files, or modify memory.
+// A metadata match is NOT permission to patch an instruction.
+typedef struct { uint64_t address, size; } GPMetadataSection;
+
+static uint64_t gp_meta_ptr(uint64_t p) {
+    return p & 0x00007fffffffffffULL; // strip userspace PAC bits on arm64e
+}
+
+static BOOL gp_meta_copy(uint64_t map, uint64_t ps, uint64_t at, void *to, size_t len) {
+    if (!map || !to || !len || len > 0x20000 || ps < 0x1000 ||
+        ps > 0x10000 || (ps & (ps - 1)) ||
+        at < 0x100000000ULL || at >= 0x400000000ULL ||
+        at + len < at || at + len > 0x400000000ULL) return NO;
+    size_t copied = 0;
+    while (copied < len) {
+        uint64_t page = (at + copied) & ~(ps - 1);
+        size_t offset = (size_t)((at + copied) - page);
+        size_t chunk = MIN(len - copied, (size_t)(ps - offset));
+        struct VMShmem pg = vm_map_remote_page(map, page);
+        if (!pg.localAddress) {
+            vm_shmem_release(&pg, ps);
+            return NO;
+        }
+        memcpy((uint8_t *)to + copied,
+               (const void *)(uintptr_t)(pg.localAddress + offset), chunk);
+        vm_shmem_release(&pg, ps);
+        copied += chunk;
+    }
+    return YES;
+}
+
+static BOOL gp_meta_in_section(GPMetadataSection s, uint64_t at, size_t len) {
+    return s.address && at >= s.address && len <= s.size &&
+           at - s.address <= s.size - len;
+}
+
+// Look for complete zero-terminated identifiers in bounded metadata sections.
+static uint64_t gp_meta_find_string(uint64_t map, uint64_t ps,
+                                    GPMetadataSection sect, const char *value) {
+    size_t wordLen = strlen(value) + 1;
+    if (!sect.address || !wordLen || wordLen > 32 || sect.size > 0x100000 ||
+        sect.size < wordLen) return 0;
+    uint64_t scanned = 0;
+    while (scanned < sect.size) {
+        uint64_t pageAddr = (sect.address + scanned) & ~(ps - 1);
+        struct VMShmem page = vm_map_remote_page(map, pageAddr);
+        if (!page.localAddress) {
+            vm_shmem_release(&page, ps);
+            return 0;
+        }
+        const uint8_t *buf = (const uint8_t *)(uintptr_t)page.localAddress;
+        size_t pageOff = (size_t)((sect.address + scanned) - pageAddr);
+        size_t count = (size_t)MIN(sect.size - scanned, ps - pageOff);
+        for (size_t j = 0; j + wordLen <= count; j++) {
+            uint64_t where = sect.address + scanned + j;
+            if (memcmp(buf + pageOff + j, value, wordLen) == 0) {
+                BOOL startsName = j == 0 || buf[pageOff + j - 1] == 0;
+                if (startsName) {
+                    vm_shmem_release(&page, ps);
+                    return where;
+                }
+            }
+        }
+        vm_shmem_release(&page, ps);
+        scanned += count;
+    }
+    return 0;
+}
+
+static void gp_live_identify_mmove(uint64_t map, uint64_t imageStart,
+                                   uint64_t ps, const uint64_t *matches, int nMatches) {
+    struct mach_header_64 mh = {0};
+    if (!gp_meta_copy(map, ps, imageStart, &mh, sizeof(mh)) ||
+        mh.magic != MH_MAGIC_64 || mh.filetype != MH_EXECUTE ||
+        !mh.ncmds || mh.ncmds > 1024 || mh.sizeofcmds < 8 ||
+        mh.sizeofcmds > 0x20000) {
+        log_user("[GP-META] Invalid/unreadable Mach-O load commands. No patch.\n");
+        return;
+    }
+    uint8_t *cmds = malloc(mh.sizeofcmds);
+    if (!cmds) return;
+    if (!gp_meta_copy(map, ps, imageStart + sizeof(mh), cmds, mh.sizeofcmds)) {
+        free(cmds);
+        log_user("[GP-META] Load command mapping failed. No patch.\n");
+        return;
+    }
+    uint64_t slide = 0;
+    BOOL haveSlide = NO;
+    size_t at = 0;
+    // Image VM slide comes from the segment containing the Mach-O header.
+    for (uint32_t i = 0; i < mh.ncmds; ++i) {
+        if (at + sizeof(struct load_command) > mh.sizeofcmds) break;
+        const struct load_command *lc = (const struct load_command *)(cmds + at);
+        if (lc->cmdsize < sizeof(*lc) || lc->cmdsize > mh.sizeofcmds - at) break;
+        if (lc->cmd == LC_SEGMENT_64 && lc->cmdsize >= sizeof(struct segment_command_64)) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            if (strncmp(seg->segname, "__TEXT", 16) == 0 && seg->fileoff == 0 &&
+                imageStart >= seg->vmaddr) {
+                slide = imageStart - seg->vmaddr;
+                haveSlide = YES;
+                break;
+            }
+        }
+        at += lc->cmdsize;
+    }
+    GPMetadataSection className = {0}, methodName = {0}, constSections[8] = {{0}};
+    int constCount = 0;
+    at = 0;
+    if (haveSlide) for (uint32_t i = 0; i < mh.ncmds; ++i) {
+        if (at + sizeof(struct load_command) > mh.sizeofcmds) break;
+        const struct load_command *lc = (const struct load_command *)(cmds + at);
+        if (lc->cmdsize < sizeof(*lc) || lc->cmdsize > mh.sizeofcmds - at) break;
+        if (lc->cmd == LC_SEGMENT_64 && lc->cmdsize >= sizeof(struct segment_command_64)) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            if (seg->nsects <= 128 &&
+                (size_t)seg->nsects * sizeof(struct section_64) <=
+                lc->cmdsize - sizeof(*seg)) {
+                const struct section_64 *sections =
+                    (const struct section_64 *)(cmds + at + sizeof(*seg));
+                for (uint32_t j = 0; j < seg->nsects; ++j) {
+                    const struct section_64 *sect = &sections[j];
+                    if (sect->size == 0 || sect->addr > UINT64_MAX - slide) continue;
+                    GPMetadataSection view = {sect->addr + slide, sect->size};
+                    if (strncmp(sect->sectname, "__objc_classname", 16) == 0)
+                        className = view;
+                    else if (strncmp(sect->sectname, "__objc_methname", 16) == 0)
+                        methodName = view;
+                    else if (strncmp(sect->sectname, "__objc_const", 16) == 0 &&
+                             constCount < 8) constSections[constCount++] = view;
+                }
+            }
+        }
+        at += lc->cmdsize;
+    }
+    free(cmds);
+
+    log_user("[GP-META] Mach-O slide=0x%llx classnames=%llu bytes methnames=%llu bytes objc_const sections=%d.\n",
+             (unsigned long long)slide, (unsigned long long)className.size,
+             (unsigned long long)methodName.size, constCount);
+    if (!haveSlide || !className.address || !methodName.address || !constCount) {
+        log_user("[GP-META] Required Objective-C sections not found; method unresolved.\n");
+        return;
+    }
+    const char *targets[3] = {"PoolScene", "PoolScene2", "PoolScene3"};
+    uint64_t classStr[3] = {0};
+    for (int k = 0; k < 3; ++k) {
+        classStr[k] = gp_meta_find_string(map, ps, className, targets[k]);
+        log_user("[GP-META] Classname %s address=0x%llx.\n",
+                 targets[k], (unsigned long long)classStr[k]);
+    }
+    uint64_t mMoveStr = gp_meta_find_string(map, ps, methodName, "mMove");
+    log_user("[GP-META] Selector mMove string=0x%llx.\n",
+             (unsigned long long)mMoveStr);
+    if (!mMoveStr || (!classStr[0] && !classStr[1] && !classStr[2])) {
+        log_user("[GP-META] Missing required strings; cannot identify method.\n");
+        return;
+    }
+
+    uint64_t methods[3] = {0};
+    uint64_t bases[3] = {0};
+    int roMatches[3] = {0};
+    CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 5.0;
+    int scannedPages = 0;
+    // Scan only __objc_const, looking for class_ro_t.name at offset 24.
+    // Never chase arbitrary pointers; use exact class-name string addresses.
+    for (int si = 0; si < constCount && scannedPages < 256; ++si) {
+        GPMetadataSection section = constSections[si];
+        if (!section.address || section.size > 0x400000) continue;
+        uint64_t off = 0;
+        while (off < section.size && scannedPages < 256) {
+            if (CFAbsoluteTimeGetCurrent() > deadline) break;
+            uint64_t addr = section.address + off;
+            uint64_t pageAddr = addr & ~(ps - 1);
+            struct VMShmem pg = vm_map_remote_page(map, pageAddr);
+            if (!pg.localAddress) {
+                vm_shmem_release(&pg, ps);
+                break;
+            }
+            ++scannedPages;
+            size_t within = (size_t)(addr - pageAddr);
+            size_t count = (size_t)MIN(ps - within, section.size - off);
+            const uint8_t *p = (const uint8_t *)(uintptr_t)pg.localAddress + within;
+            for (size_t j = 0; j + 8 <= count; j += 8) {
+                uint64_t namePtr = 0;
+                memcpy(&namePtr, p + j, 8);
+                namePtr = gp_meta_ptr(namePtr);
+                for (int k = 0; k < 3; ++k) {
+                    if (!classStr[k] || namePtr != classStr[k] ||
+                        addr + j < 24 || !gp_meta_in_section(section, addr + j - 24, 40))
+                        continue;
+                    uint64_t ro = addr + j - 24, ml = 0;
+                    uint32_t roFlags = 0;
+                    if (!gp_meta_copy(map, ps, ro, &roFlags, 4) ||
+                        !gp_meta_copy(map, ps, ro + 32, &ml, 8)) continue;
+                    // Ignore invalid zero/misaligned method-list pointers.
+                    ml = gp_meta_ptr(ml) & ~3ULL;
+                    if (!ml || (ml & 3)) continue;
+                    log_user("[GP-META] %s class_ro=0x%llx flags=0x%x baseMethods=0x%llx.\n",
+                             targets[k], (unsigned long long)ro,
+                             roFlags, (unsigned long long)ml);
+                    ++roMatches[k];
+                    if (roMatches[k] == 1) bases[k] = ml;
+                }
+            }
+            vm_shmem_release(&pg, ps);
+            off += count;
+        }
+    }
+    log_user("[GP-META] objc_const pages scanned=%d.\n", scannedPages);
+
+    // Parse only uniquely identified class_ro_t base method lists.
+    for (int k = 0; k < 3; ++k) {
+        if (roMatches[k] != 1 || !bases[k]) {
+            log_user("[GP-META] %s class metadata ambiguous/missing (%d matches).\n",
+                     targets[k], roMatches[k]);
+            continue;
+        }
+        uint32_t info[2] = {0};
+        if (!gp_meta_copy(map, ps, bases[k], info, sizeof(info))) continue;
+        BOOL small = (info[0] & 0x80000000U) != 0;
+        BOOL direct = (info[0] & 0x40000000U) != 0;
+        uint32_t entSize = info[0] & 0x0000fffcU, count = info[1];
+        if (count > 512 || !count || entSize != (small ? 12U : 24U)) {
+            log_user("[GP-META] %s unsupported method list flags=0x%x count=%u.\n",
+                     targets[k], info[0], count);
+            continue;
+        }
+        int found = 0;
+        for (uint32_t i = 0; i < count; ++i) {
+            uint64_t e = bases[k] + 8 + (uint64_t)entSize * i;
+            uint64_t nameAddr = 0, imp = 0;
+            if (small) {
+                int32_t offsets[3] = {0};
+                if (!gp_meta_copy(map, ps, e, offsets, sizeof(offsets))) break;
+                uint64_t nameField = (uint64_t)((int64_t)e + offsets[0]);
+                if (direct) nameAddr = nameField;
+                else {
+                    uint64_t ptr = 0;
+                    if (!gp_meta_copy(map, ps, nameField, &ptr, 8)) continue;
+                    nameAddr = gp_meta_ptr(ptr);
+                }
+                imp = (uint64_t)((int64_t)(e + 8) + offsets[2]);
+            } else {
+                uint64_t fields[3] = {0};
+                if (!gp_meta_copy(map, ps, e, fields, sizeof(fields))) break;
+                nameAddr = gp_meta_ptr(fields[0]);
+                imp = gp_meta_ptr(fields[2]);
+            }
+            if (nameAddr != mMoveStr) continue;
+            ++found;
+            methods[k] = imp;
+            log_user("[GP-META] %s::mMove IMP=0x%llx; list format=%s.\n",
+                     targets[k], (unsigned long long)imp, small ? "relative" : "absolute");
+        }
+        if (found != 1) {
+            methods[k] = 0;
+            log_user("[GP-META] %s::mMove not uniquely resolved (%d matches).\n",
+                     targets[k], found);
+        }
+    }
+    for (int i = 0; i < nMatches && i < 8; ++i) {
+        if (!matches[i]) continue;
+        for (int k = 0; k < 3; ++k) {
+            // A distance from an IMP is NOT a method-boundary verification.
+            if (methods[k] && matches[i] >= methods[k] &&
+                matches[i] - methods[k] < 0x2000ULL)
+                log_user("[GP-META] Candidate C%d is +0x%llx from %s::mMove IMP (PROXIMITY ONLY).\n",
+                         i+1, (unsigned long long)(matches[i]-methods[k]), targets[k]);
+        }
+    }
+    log_user("[GP-META] Analysis complete; no patch and no remote execution.\n");
+}
+
 static void gp_trajectory_live_signature_probe(void) {
     log_user("[GP-LIVE] Starting experimental in-memory signature probe (NO PATCH).\n");
     if (!kexploit_krw_ready() || remote_call_inflight_count() || remote_call_init_wedged()) {
@@ -14269,6 +14544,7 @@ static void gp_trajectory_live_signature_probe(void) {
              (unsigned long long)imageStart, (unsigned long long)imageEnd);
     uint64_t scanEnd = MIN(imageEnd, imageStart + 0x200000ULL);
     int pages = 0, failures = 0, needleMatches = 0;
+    uint64_t candidateAddresses[8] = {0};
     CFAbsoluteTime begun = CFAbsoluteTimeGetCurrent();
     for (uint64_t addr = imageStart; addr < scanEnd; addr += pageSize) {
         if (CFAbsoluteTimeGetCurrent() - begun > 8.0) break;
@@ -14291,6 +14567,7 @@ static void gp_trajectory_live_signature_probe(void) {
             uint32_t instruction = 0;
             memcpy(&instruction, b + o, 4);
             if (instruction == 0x52a84e08U) {
+                if (needleMatches < 8) candidateAddresses[needleMatches] = addr + o;
                 ++needleMatches;
                 if (needleMatches <= 8) {
                     // This MOVZ instruction constructs the bit pattern 0x42700000
@@ -14318,6 +14595,7 @@ static void gp_trajectory_live_signature_probe(void) {
     }
     log_user("[GP-LIVE] Read %d pages; mapping failures=%d; opcode candidates=%d.\n",
              pages, failures, needleMatches);
+    gp_live_identify_mmove(map, imageStart, pageSize, candidateAddresses, MIN(needleMatches, 8));
     log_user("[GP-LIVE] FINISHED: No writes to GamePigeon. Matches alone do not prove mMove identity.\n");
 }
 
