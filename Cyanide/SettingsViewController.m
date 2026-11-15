@@ -65,6 +65,7 @@
 #import <mach/host_info.h>
 #import "DSKeepAlive.h"
 #import "TaskRop/RemoteCall.h"
+#import "TaskRop/VM.h"
 #import "TaskRop/Exception.h"   // round 21: excport lifecycle gate
 #import "kexploit/kutils.h"
 #import "utils/process.h"
@@ -14188,6 +14189,121 @@ static void gp_trajectory_inspect_readonly(void) {
     log_user("[GP-TRAJECTORY] SAFE inspection finished. No RemoteCall, no game-memory modification.\n");
 }
 
+// Experimental *live* GamePigeon memory inspection. No game-code writes.
+// Uses Cyanide's existing kernel VM-object mapping, which changes local
+// mapping bookkeeping and may destabilize the device even though read-only.
+static void gp_trajectory_live_signature_probe(void) {
+    log_user("[GP-LIVE] Starting experimental in-memory signature probe (NO PATCH).\n");
+    if (!kexploit_krw_ready() || remote_call_inflight_count() || remote_call_init_wedged()) {
+        log_user("[GP-LIVE] KRW unavailable or RC busy. Abort.\n");
+        return;
+    }
+    const int cap = 2048;
+    procmgr_entry_t *entries = calloc(cap, sizeof(*entries));
+    if (!entries) return;
+    int n = procmgr_list(entries, cap), matches = 0, pid = 0;
+    uint64_t kproc = 0;
+    char comm[32] = {0};
+    for (int i = 0; i < n; ++i) {
+        size_t len = strnlen(entries[i].name, sizeof(entries[i].name));
+        if (len < 12 || len > strlen("MessagesExtension") ||
+            strncmp(entries[i].name, "MessagesExtension", len)) continue;
+        char vnode[1024] = {0};
+        if (!procmgr_exe_path_for_entry(entries[i].kproc, entries[i].pid,
+                                        vnode, sizeof(vnode))) continue;
+        NSString *p = [NSString stringWithUTF8String:vnode];
+        if (![p containsString:@"/containers/Bundle/Application/"] ||
+            ![p hasSuffix:@"/Game Pack.app/PlugIns/MessagesExtension.appex/MessagesExtension"])
+            continue;
+        ++matches;
+        kproc = entries[i].kproc; pid = entries[i].pid;
+        strncpy(comm, entries[i].name, sizeof(comm)-1);
+    }
+    free(entries);
+    if (n < 0 || matches != 1 || !kproc) {
+        log_user("[GP-LIVE] Candidate count=%d; need exactly one. Abort.\n", matches);
+        return;
+    }
+    char verifyComm[32] = {0};
+    uint64_t verifyProc = 0;
+    if (procmgr_identity_for_pid(pid, verifyComm, sizeof(verifyComm), &verifyProc) != 0 ||
+        verifyProc != kproc || strcmp(comm, verifyComm)) {
+        log_user("[GP-LIVE] Candidate changed. Abort.\n");
+        return;
+    }
+    uint64_t task = proc_task(kproc);
+    uint64_t map = task ? task_get_vm_map(task) : 0;
+    const uint64_t pageSize = (uint64_t)vm_page_size;
+    if (!is_kaddr_valid(task) || !is_kaddr_valid(map) ||
+        pageSize < 0x1000 || pageSize > 0x10000 || (pageSize & (pageSize - 1))) {
+        log_user("[GP-LIVE] Invalid task/map/page size. Abort.\n");
+        return;
+    }
+    __block uint64_t imageStart = 0, imageEnd = 0;
+    __block int execRegions = 0;
+    vm_map_iterate_entries(map, ^(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop) {
+        if (execRegions >= 32) { *stop = YES; return; }
+        if (start < 0x100000000ULL || start > 0x400000000ULL ||
+            end <= start || (start % pageSize)) return;
+        struct VMEntryInfo info = {0};
+        if (!vm_map_entry_info(entry, &info) || info.isSubmap || !info.object ||
+            !(info.protection & VM_PROT_EXECUTE)) return;
+        ++execRegions;
+        struct VMShmem pg = vm_map_remote_page(map, start);
+        if (!pg.localAddress) {
+            vm_shmem_release(&pg, pageSize);
+            return;
+        }
+        uint32_t words[4] = {0};
+        memcpy(words, (const void *)(uintptr_t)pg.localAddress, sizeof(words));
+        vm_shmem_release(&pg, pageSize);
+        if (words[0] == 0xfeedfacfU && words[3] == 2U) {
+            imageStart = start; imageEnd = end; *stop = YES;
+        }
+    });
+    if (!imageStart) {
+        log_user("[GP-LIVE] No readable MH_EXECUTE image found. No patch.\n");
+        return;
+    }
+    log_user("[GP-LIVE] Found Mach-O MH_EXECUTE region: 0x%llx..0x%llx.\n",
+             (unsigned long long)imageStart, (unsigned long long)imageEnd);
+    uint64_t scanEnd = MIN(imageEnd, imageStart + 0x200000ULL);
+    int pages = 0, failures = 0, needleMatches = 0;
+    CFAbsoluteTime begun = CFAbsoluteTimeGetCurrent();
+    for (uint64_t addr = imageStart; addr < scanEnd; addr += pageSize) {
+        if (CFAbsoluteTimeGetCurrent() - begun > 8.0) break;
+        char currentComm[32] = {0};
+        uint64_t currentProc = 0;
+        if (procmgr_identity_for_pid(pid, currentComm, sizeof(currentComm), &currentProc) != 0 ||
+            currentProc != kproc || strcmp(currentComm, comm)) {
+            log_user("[GP-LIVE] Target changed during scan; abort.\n");
+            break;
+        }
+        struct VMShmem pg = vm_map_remote_page(map, addr);
+        if (!pg.localAddress) {
+            vm_shmem_release(&pg, pageSize);
+            if (++failures >= 3) break;
+            continue;
+        }
+        ++pages;
+        const uint8_t *b = (const uint8_t *)(uintptr_t)pg.localAddress;
+        for (uint64_t o = 0; o + 4 <= pageSize; o += 4) {
+            uint32_t instruction = 0;
+            memcpy(&instruction, b + o, 4);
+            if (instruction == 0x52a84e08U) {
+                ++needleMatches;
+                if (needleMatches <= 8)
+                    log_user("[GP-LIVE] GameSeagull historical instruction at 0x%llx (UNVERIFIED method).\n",
+                             (unsigned long long)(addr + o));
+            }
+        }
+        vm_shmem_release(&pg, pageSize);
+    }
+    log_user("[GP-LIVE] Read %d pages; mapping failures=%d; opcode candidates=%d.\n",
+             pages, failures, needleMatches);
+    log_user("[GP-LIVE] FINISHED: No writes to GamePigeon. Matches alone do not prove mMove identity.\n");
+}
+
 @implementation SettingsViewController
 
 // Init-watchdog wedge (RemoteCall.m): an injection deadlocked uninterruptibly
@@ -14341,6 +14457,8 @@ static void gp_trajectory_inspect_readonly(void) {
     [rows addObject:@{ @"kind": @"button", @"action": @"quickloader-open-sources", @"title": @"Browse Sources" }];
     [rows addObject:@{ @"kind": @"button", @"action": @"gp-trajectory-inspect",
                           @"title": @"Inspect GamePigeon Process (Read-only)" }];
+    [rows addObject:@{ @"kind": @"button", @"action": @"gp-live-probe",
+                          @"title": @"Probe Live GamePigeon Code (Experimental)" }];
 
     if (filename) {
         [rows addObject:@{ @"kind": @"button", @"action": @"quickloader-clear",
@@ -20551,6 +20669,21 @@ void cyanide_present_contact(UIViewController *host)
                 gp_trajectory_inspect_readonly();
             });
             return;
+        } else if ([action isEqualToString:@"gp-live-probe"]) {
+            UIAlertController *alert = [UIAlertController
+                alertControllerWithTitle:@"Experimental live memory probe"
+                message:@"This reads GamePigeon's executable from kernel VM mappings. It does not patch the game, but mapping process memory can crash 8 Ball or destabilize iPadOS. Back up the iPad first."
+                preferredStyle:UIAlertControllerStyleAlert];
+            [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+            [alert addAction:[UIAlertAction actionWithTitle:@"Probe (No Patch)"
+                style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+                    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                        gp_trajectory_live_signature_probe();
+                    });
+                }]];
+            [self presentViewController:alert animated:YES completion:nil];
+            return;
+
         } else if ([action isEqualToString:@"gp-trajectory-write"]) {
             // Defensively reject stale/invoked actions even though the UI row
             // has been removed. The prior RemoteCall inspection crashed 8 Ball.
