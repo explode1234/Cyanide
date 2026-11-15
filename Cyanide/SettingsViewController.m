@@ -14104,39 +14104,49 @@ static void gp_trajectory_attempt(BOOL permitWrite) {
                 strncmp(entries[i].name, "MessagesExtension", commLen) != 0) continue;
             char processPath[4096] = {0};
             int bytes = proc_pidpath(entries[i].pid, processPath, sizeof(processPath));
-            if (bytes <= 0 || processPath[0] != '/') {
-                // Diagnostic only: log the kernel's vnode-based path when
-                // libproc is sandbox-blocked. NEVER use this fallback to
-                // authorize a write; bundle identity is still unverified.
+            NSString *exe = nil;
+            NSBundle *bundle = nil;
+            BOOL usedVnodeFallback = NO;
+            if (bytes > 0 && processPath[0] == '/') {
+                exe = [NSString stringWithUTF8String:processPath];
+                if (![[exe lastPathComponent] isEqualToString:@"MessagesExtension"]) continue;
+                bundle = [NSBundle bundleWithPath:[exe stringByDeletingLastPathComponent]];
+                if (![bundle.bundleIdentifier isEqualToString:@"com.gamerdelights.gamepigeon.ext"]) {
+                    log_user("[GP-TRAJECTORY] PID %d is not verified GamePigeon (bundle ID mismatch).\\n",
+                             entries[i].pid);
+                    continue;
+                }
+            } else {
+                // iPadOS may deny libproc access to another app extension.
+                // Use the kernel's executable vnode path only for this narrow,
+                // original-GamePigeon packaging pattern. A prefix-only name
+                // match is insufficient; runtime and instruction checks follow.
                 char vnodePath[1024] = {0};
                 BOOL haveVnodePath = procmgr_exe_path_for_entry(
                     entries[i].kproc, entries[i].pid, vnodePath, sizeof(vnodePath));
-                if (haveVnodePath)
-                    log_user("[GP-TRAJECTORY] PID %d kernel vnode path (UNVERIFIED): %s\n",
-                             entries[i].pid, vnodePath);
-                else
-                    log_user("[GP-TRAJECTORY] PID %d kernel vnode path unavailable.\n",
+                NSString *candidate = haveVnodePath ?
+                    [NSString stringWithUTF8String:vnodePath] : nil;
+                BOOL candidateMatch =
+                    [candidate containsString:@"/containers/Bundle/Application/"] &&
+                    [candidate hasSuffix:@"/Game Pack.app/PlugIns/MessagesExtension.appex/MessagesExtension"];
+                if (!candidateMatch) {
+                    log_user("[GP-TRAJECTORY] PID %d has no allowed GamePigeon vnode path; skipped.\\n",
                              entries[i].pid);
-                log_user("[GP-TRAJECTORY] proc_pidpath denied for PID %d; no write permitted.\n",
-                         entries[i].pid);
-                matches = -1;
-                break;
-            }
-            NSString *exe = [NSString stringWithUTF8String:processPath];
-            if (![[exe lastPathComponent] isEqualToString:@"MessagesExtension"]) continue;
-            NSBundle *bundle = [NSBundle bundleWithPath:[exe stringByDeletingLastPathComponent]];
-            NSString *identifier = bundle.bundleIdentifier;
-            if (![identifier isEqualToString:@"com.gamerdelights.gamepigeon.ext"]) {
-                log_user("[GP-TRAJECTORY] PID %d is not verified GamePigeon (bundle lookup failed/different).\n",
-                         entries[i].pid);
-                continue;
+                    continue;
+                }
+                exe = candidate;
+                usedVnodeFallback = YES;
+                log_user("[GP-TRAJECTORY] PID %d accepted as GamePigeon CANDIDATE by vnode path: %s\\n",
+                         entries[i].pid, vnodePath);
             }
             ++matches;
             targetPid = entries[i].pid;
             targetProc = entries[i].kproc;
             strncpy(targetComm, entries[i].name, sizeof(targetComm) - 1);
             targetComm[sizeof(targetComm) - 1] = '\0';
-            identifiedVersion = [bundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
+            identifiedVersion = usedVnodeFallback ?
+                @"(vnode candidate; bundle ID unavailable)" :
+                [bundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
         }
         free(entries);
         if (n < 0 || matches != 1 || !targetProc) {
