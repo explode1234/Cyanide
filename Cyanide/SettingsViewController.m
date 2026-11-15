@@ -14112,7 +14112,7 @@ static void gp_trajectory_attempt(BOOL permitWrite) {
                 if (![[exe lastPathComponent] isEqualToString:@"MessagesExtension"]) continue;
                 bundle = [NSBundle bundleWithPath:[exe stringByDeletingLastPathComponent]];
                 if (![bundle.bundleIdentifier isEqualToString:@"com.gamerdelights.gamepigeon.ext"]) {
-                    log_user("[GP-TRAJECTORY] PID %d is not verified GamePigeon (bundle ID mismatch).\\n",
+                    log_user("[GP-TRAJECTORY] PID %d is not verified GamePigeon (bundle ID mismatch).\n",
                              entries[i].pid);
                     continue;
                 }
@@ -14130,13 +14130,13 @@ static void gp_trajectory_attempt(BOOL permitWrite) {
                     [candidate containsString:@"/containers/Bundle/Application/"] &&
                     [candidate hasSuffix:@"/Game Pack.app/PlugIns/MessagesExtension.appex/MessagesExtension"];
                 if (!candidateMatch) {
-                    log_user("[GP-TRAJECTORY] PID %d has no allowed GamePigeon vnode path; skipped.\\n",
+                    log_user("[GP-TRAJECTORY] PID %d has no allowed GamePigeon vnode path; skipped.\n",
                              entries[i].pid);
                     continue;
                 }
                 exe = candidate;
                 usedVnodeFallback = YES;
-                log_user("[GP-TRAJECTORY] PID %d accepted as GamePigeon CANDIDATE by vnode path: %s\\n",
+                log_user("[GP-TRAJECTORY] PID %d accepted as GamePigeon CANDIDATE by vnode path: %s\n",
                          entries[i].pid, vnodePath);
             }
             ++matches;
@@ -14159,7 +14159,7 @@ static void gp_trajectory_attempt(BOOL permitWrite) {
             log_user("[GP-TRAJECTORY] Process selection ambiguous or changed. Abort.\n");
             return;
         }
-        log_user("[GP-TRAJECTORY] Verified bundle ID, PID=%d comm=%s version=%s.\n",
+        log_user("[GP-TRAJECTORY] Unique candidate, PID=%d comm=%s version=%s.\n",
                  targetPid, targetComm, identifiedVersion ? identifiedVersion.UTF8String : "(unknown)");
 
         RemoteCallSession *session = [[RemoteCallSession alloc]
