@@ -118,6 +118,12 @@ bool procmgr_role_is_app(int role);         // either of the above (a GUI app)
 #define PM_KIND_SERVICE 0
 int procmgr_exe_kind(int pid);
 
+// Read-only diagnostic: reconstruct an executable path from kernel vnode
+// metadata for a specifically captured pid/struct-proc pair. The result may
+// be mount-truncated or incomplete; never treat it as verified bundle identity.
+// Returns false if the process changed or any KRW read was uncertain.
+bool procmgr_exe_path_for_entry(uint64_t kproc, int pid, char *out, size_t outlen);
+
 // Force-quit the captured Process Viewer row via SIGKILL (KRW is only used for
 // the protected-process and identity checks). The expected comm and struct proc
 // address must come from the same list snapshot; a PID-only call is refused.
