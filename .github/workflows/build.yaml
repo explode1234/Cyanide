@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - gp-trajectory-experiment
+      - gp-live-memory-probe
 
 jobs:
   build:
