@@ -14071,188 +14071,101 @@ BOOL settings_root_remove_xattr(NSString *path, const char *name, NSString **err
 
 @end
 
-// GamePigeon trajectory experiment. No persistent patching: fail closed on
-// ambiguous process identity or unexpected code, and never alter the IPA on disk.
-// IMPORTANT: experimental code, not validated on any GamePigeon/iPadOS build.
+// GamePigeon process diagnostics only. This routine does not attach to,
+// suspend, hijack, execute inside, or write to the MessagesExtension process.
+// The previous RemoteCall-based inspection destabilized that extension.
 extern int proc_pidpath(int pid, void *buffer, uint32_t buffersize);
 
-static void gp_trajectory_attempt(BOOL permitWrite) {
-    log_user("[GP-TRAJECTORY] Starting %s mode.\n", permitWrite ? "experimental write" : "inspection");
-    @synchronized (settings_rc_lock()) {
-        if (!kexploit_krw_ready() || remote_call_inflight_count() || remote_call_init_wedged()) {
-            log_user("[GP-TRAJECTORY] Kernel access unavailable or RemoteCall busy; aborting.\n");
-            return;
-        }
-
-        // There can be unrelated plug-ins with this executable name. An
-        // executable-name match by itself is NEVER an identity check.
-        const int cap = 2048;
-        procmgr_entry_t *entries = (procmgr_entry_t *)calloc(cap, sizeof(*entries));
-        if (!entries) return;
-        int n = procmgr_list(entries, cap);
-        int matches = 0;
-        int targetPid = 0;
-        uint64_t targetProc = 0;
-        char targetComm[32] = {0};
-        NSString *identifiedVersion = nil;
-        for (int i = 0; i < n; i++) {
-            // The kernel's comm field can truncate names (including
-            // MessagesExtension). Match the available prefix, then verify
-            // the full executable path and its actual bundle identifier.
-            size_t commLen = strnlen(entries[i].name, sizeof(entries[i].name));
-            if (commLen < 12 || commLen > strlen("MessagesExtension") ||
-                strncmp(entries[i].name, "MessagesExtension", commLen) != 0) continue;
-            char processPath[4096] = {0};
-            int bytes = proc_pidpath(entries[i].pid, processPath, sizeof(processPath));
-            NSString *exe = nil;
-            NSBundle *bundle = nil;
-            BOOL usedVnodeFallback = NO;
-            if (bytes > 0 && processPath[0] == '/') {
-                exe = [NSString stringWithUTF8String:processPath];
-                if (![[exe lastPathComponent] isEqualToString:@"MessagesExtension"]) continue;
-                bundle = [NSBundle bundleWithPath:[exe stringByDeletingLastPathComponent]];
-                if (![bundle.bundleIdentifier isEqualToString:@"com.gamerdelights.gamepigeon.ext"]) {
-                    log_user("[GP-TRAJECTORY] PID %d is not verified GamePigeon (bundle ID mismatch).\n",
-                             entries[i].pid);
-                    continue;
-                }
-            } else {
-                // iPadOS may deny libproc access to another app extension.
-                // Use the kernel's executable vnode path only for this narrow,
-                // original-GamePigeon packaging pattern. A prefix-only name
-                // match is insufficient; runtime and instruction checks follow.
-                char vnodePath[1024] = {0};
-                BOOL haveVnodePath = procmgr_exe_path_for_entry(
-                    entries[i].kproc, entries[i].pid, vnodePath, sizeof(vnodePath));
-                NSString *candidate = haveVnodePath ?
-                    [NSString stringWithUTF8String:vnodePath] : nil;
-                BOOL candidateMatch =
-                    [candidate containsString:@"/containers/Bundle/Application/"] &&
-                    [candidate hasSuffix:@"/Game Pack.app/PlugIns/MessagesExtension.appex/MessagesExtension"];
-                if (!candidateMatch) {
-                    log_user("[GP-TRAJECTORY] PID %d has no allowed GamePigeon vnode path; skipped.\n",
-                             entries[i].pid);
-                    continue;
-                }
-                exe = candidate;
-                usedVnodeFallback = YES;
-                log_user("[GP-TRAJECTORY] PID %d accepted as GamePigeon CANDIDATE by vnode path: %s\n",
-                         entries[i].pid, vnodePath);
-            }
-            ++matches;
-            targetPid = entries[i].pid;
-            targetProc = entries[i].kproc;
-            strncpy(targetComm, entries[i].name, sizeof(targetComm) - 1);
-            targetComm[sizeof(targetComm) - 1] = '\0';
-            identifiedVersion = usedVnodeFallback ?
-                @"(vnode candidate; bundle ID unavailable)" :
-                [bundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
-        }
-        free(entries);
-        if (n < 0 || matches != 1 || !targetProc) {
-            log_user("[GP-TRAJECTORY] Verified target count=%d; require exactly one. Abort.\n", matches);
-            return;
-        }
-        // Ensure RemoteCall's process-name selector resolves to the EXACT
-        // process instance we verified; do not redirect to another extension.
-        if (!targetComm[0] || proc_find_by_name(targetComm) != targetProc) {
-            log_user("[GP-TRAJECTORY] Process selection ambiguous or changed. Abort.\n");
-            return;
-        }
-        log_user("[GP-TRAJECTORY] Unique candidate, PID=%d comm=%s version=%s.\n",
-                 targetPid, targetComm, identifiedVersion ? identifiedVersion.UTF8String : "(unknown)");
-
-        RemoteCallSession *session = [[RemoteCallSession alloc]
-            initWithProcess:[NSString stringWithUTF8String:targetComm] useMigFilterBypass:NO
-            firstExceptionTimeoutMS:5000];
-        if (!session) {
-            log_user("[GP-TRAJECTORY] Could not open RemoteCall session.\n");
-            return;
-        }
-        @try {
-            char currentComm[32] = {0};
-            uint64_t currentProc = 0;
-            BOOL sameTarget = (session.pid == targetPid &&
-                procmgr_identity_for_pid(targetPid, currentComm, sizeof(currentComm), &currentProc) == 0 &&
-                strcmp(currentComm, targetComm) == 0 &&
-                currentProc == targetProc);
-            if (!sameTarget) {
-                log_user("[GP-TRAJECTORY] Session PID/process identity changed; refusing patch.\n");
-            } else {
-                uint64_t pool = r_session_class(session, "PoolScene");
-                uint64_t ball = r_session_class(session, "PoolBall");
-                uint64_t sel = r_session_sel(session, "mMove");
-                if (!pool || !ball || !sel) {
-                    log_user("[GP-TRAJECTORY] Required pool runtime classes/selector not available.\n");
-                } else {
-                    uint64_t method = r_session_dlsym_call(session, 500, "class_getInstanceMethod",
-                                                          pool, sel, 0, 0, 0, 0, 0, 0);
-                    uint64_t imp = method ? r_session_dlsym_call(session, 500, "method_getImplementation",
-                                                                  method, 0, 0, 0, 0, 0, 0, 0) : 0;
-                    // ARM64 code addresses must be instruction-aligned. Strip
-                    // high PAC bits conservatively; failure = no write.
-                    uint64_t entry = imp & 0x00007fffffffffffULL;
-                    if (!method || !imp || entry < 0x100000000ULL ||
-                        entry > 0x7fffffffffffULL || (entry & 3)) {
-                        log_user("[GP-TRAJECTORY] mMove implementation could not be resolved.\n");
-                    } else {
-                        uint8_t bytes[1024] = {0};
-                        if (![session remoteRead:entry to:bytes size:sizeof(bytes)]) {
-                            log_user("[GP-TRAJECTORY] Cannot read mMove code.\n");
-                        } else {
-                            const uint32_t needle = 0x52a84e08U;
-                            const uint32_t patch = 0x52a9cdc8U;
-                            size_t found = 0;
-                            int matches = 0;
-                            for (size_t offset = 0; offset + 4 <= sizeof(bytes); offset += 4) {
-                                uint32_t insn = 0;
-                                memcpy(&insn, bytes + offset, 4);
-                                if (insn == 0xd65f03c0U || insn == 0xd65f0fffU) break;
-                                if (insn == needle) { found = offset; ++matches; }
-                            }
-                            log_user("[GP-TRAJECTORY] Historical pattern matches=%d.\n", matches);
-                            if (matches != 1) {
-                                log_user("[GP-TRAJECTORY] No unique signature. Refusing patch.\n");
-                            } else if (!permitWrite) {
-                                log_user("[GP-TRAJECTORY] Inspect-only; no memory writes.\n");
-                            } else {
-                                uint64_t dest = entry + found;
-                                // Verify the exact instruction one more time.
-                                uint32_t before = 0;
-                                if (![session remoteRead:dest to:&before size:sizeof(before)] ||
-                                    before != needle) {
-                                    log_user("[GP-TRAJECTORY] Prewrite verification failed.\n");
-                                } else {
-                                    BOOL wrote = [session remoteWrite:dest from:&patch size:sizeof(patch)];
-                                    uint32_t after = 0;
-                                    BOOL verified = wrote &&
-                                        [session remoteRead:dest to:&after size:sizeof(after)] &&
-                                        after == patch;
-                                    if (verified) {
-                                        (void)r_session_dlsym_call(session, 500, "sys_icache_invalidate",
-                                                                  dest, 4, 0, 0, 0, 0, 0, 0);
-                                        log_user("[GP-TRAJECTORY] Write/readback verified; gameplay and cache flush NOT verified.\n");
-                                    } else {
-                                        // Best-effort rollback: cannot promise
-                                        // recovery if the process was destabilized.
-                                        BOOL restored = [session remoteWrite:dest from:&before size:sizeof(before)];
-                                        (void)r_session_dlsym_call(session, 500, "sys_icache_invalidate",
-                                                                  dest, 4, 0, 0, 0, 0, 0, 0);
-                                        log_user("[GP-TRAJECTORY] Write failed. Rollback attempt=%d.\n", restored);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } @catch (NSException *e) {
-            log_user("[GP-TRAJECTORY] Objective-C exception: %s\n",
-                     e.reason ? e.reason.UTF8String : "(unknown)");
-        }
-        [session destroyRemoteCall];
+static void gp_trajectory_inspect_readonly(void) {
+    log_user("[GP-TRAJECTORY] Starting SAFE process inspection (no RemoteCall, no patch).\n");
+    if (!kexploit_krw_ready()) {
+        log_user("[GP-TRAJECTORY] Kernel process list unavailable; abort.\n");
+        return;
     }
-    log_user("[GP-TRAJECTORY] Finished.\n");
+    const int cap = 2048;
+    procmgr_entry_t *entries = (procmgr_entry_t *)calloc(cap, sizeof(*entries));
+    if (!entries) {
+        log_user("[GP-TRAJECTORY] Out of memory; abort.\n");
+        return;
+    }
+    int n = procmgr_list(entries, cap);
+    if (n < 0) {
+        log_user("[GP-TRAJECTORY] Process list failed; abort.\n");
+        free(entries);
+        return;
+    }
+
+    int matches = 0;
+    int targetPid = 0;
+    uint64_t targetProc = 0;
+    char targetComm[32] = {0};
+    for (int i = 0; i < n; ++i) {
+        size_t commLen = strnlen(entries[i].name, sizeof(entries[i].name));
+        if (commLen < 12 || commLen > strlen("MessagesExtension") ||
+            strncmp(entries[i].name, "MessagesExtension", commLen) != 0) continue;
+
+        // libproc is often sandbox-denied for a different app extension.
+        char processPath[4096] = {0};
+        int bytes = proc_pidpath(entries[i].pid, processPath, sizeof(processPath));
+        NSString *exe = nil;
+        BOOL bundleVerified = NO;
+        if (bytes > 0 && processPath[0] == '/') {
+            NSString *candidate = [NSString stringWithUTF8String:processPath];
+            if (![[candidate lastPathComponent] isEqualToString:@"MessagesExtension"])
+                continue;
+            NSBundle *bundle = [NSBundle bundleWithPath:[candidate stringByDeletingLastPathComponent]];
+            if (![bundle.bundleIdentifier isEqualToString:@"com.gamerdelights.gamepigeon.ext"])
+                continue;
+            exe = candidate;
+            bundleVerified = YES;
+        } else {
+            char vnodePath[1024] = {0};
+            if (!procmgr_exe_path_for_entry(entries[i].kproc, entries[i].pid,
+                                            vnodePath, sizeof(vnodePath))) continue;
+            NSString *candidate = [NSString stringWithUTF8String:vnodePath];
+            BOOL pathLooksRight =
+                [candidate containsString:@"/containers/Bundle/Application/"] &&
+                [candidate hasSuffix:@"/Game Pack.app/PlugIns/MessagesExtension.appex/MessagesExtension"];
+            if (!pathLooksRight) continue;
+            exe = candidate;
+        }
+
+        ++matches;
+        targetPid = entries[i].pid;
+        targetProc = entries[i].kproc;
+        strncpy(targetComm, entries[i].name, sizeof(targetComm) - 1);
+        targetComm[sizeof(targetComm) - 1] = '\0';
+
+        log_user("[GP-TRAJECTORY] Candidate PID=%d comm=%s identity=%s path=%s\n",
+                 targetPid, targetComm,
+                 bundleVerified ? "bundle-ID verified" : "vnode path only (UNVERIFIED)",
+                 exe ? exe.UTF8String : "(unavailable)");
+
+        // Noninvasive on-disk binary accessibility test. Only reads a 4-byte
+        // Mach-O header; does not scan live memory or execute remote code.
+        int fd = exe ? open(exe.fileSystemRepresentation, O_RDONLY) : -1;
+        if (fd < 0) {
+            log_user("[GP-TRAJECTORY] Binary read access denied/unavailable (errno=%d).\n", errno);
+        } else {
+            uint32_t magic = 0;
+            ssize_t count = read(fd, &magic, sizeof(magic));
+            close(fd);
+            log_user("[GP-TRAJECTORY] On-disk binary header bytes=%zd magic=0x%08x (read-only).\n",
+                     count, magic);
+        }
+    }
+    free(entries);
+    if (matches != 1 || !targetProc) {
+        log_user("[GP-TRAJECTORY] Candidate count=%d; require exactly one for further analysis.\n", matches);
+    } else {
+        char currentComm[32] = {0};
+        uint64_t currentProc = 0;
+        BOOL stable = procmgr_identity_for_pid(targetPid, currentComm, sizeof(currentComm), &currentProc) == 0 &&
+                      strcmp(currentComm, targetComm) == 0 && currentProc == targetProc;
+        log_user("[GP-TRAJECTORY] Candidate PID=%d process identity %s.\n",
+                 targetPid, stable ? "stable" : "changed/unavailable");
+    }
+    log_user("[GP-TRAJECTORY] SAFE inspection finished. No RemoteCall, no game-memory modification.\n");
 }
 
 @implementation SettingsViewController
@@ -14407,9 +14320,7 @@ static void gp_trajectory_attempt(BOOL permitWrite) {
     [rows addObject:@{ @"kind": @"button", @"action": @"quickloader-run-js", @"title": @"Select .js File" }];
     [rows addObject:@{ @"kind": @"button", @"action": @"quickloader-open-sources", @"title": @"Browse Sources" }];
     [rows addObject:@{ @"kind": @"button", @"action": @"gp-trajectory-inspect",
-                          @"title": @"Inspect GamePigeon (Experimental)" }];
-    [rows addObject:@{ @"kind": @"button", @"action": @"gp-trajectory-write",
-                          @"title": @"Attempt GameSeagull Trajectory (Experimental)" }];
+                          @"title": @"Inspect GamePigeon Process (Read-only)" }];
 
     if (filename) {
         [rows addObject:@{ @"kind": @"button", @"action": @"quickloader-clear",
@@ -20617,23 +20528,13 @@ void cyanide_present_contact(UIViewController *host)
             return;
         } else if ([action isEqualToString:@"gp-trajectory-inspect"]) {
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                gp_trajectory_attempt(NO);
+                gp_trajectory_inspect_readonly();
             });
             return;
         } else if ([action isEqualToString:@"gp-trajectory-write"]) {
-            UIAlertController *confirm = [UIAlertController
-                alertControllerWithTitle:@"Experimental GamePigeon memory patch"
-                message:@"This can crash GamePigeon or iPadOS and may require a full restore. It has not been device-tested. Attempt a one-process memory patch?"
-                preferredStyle:UIAlertControllerStyleAlert];
-            [confirm addAction:[UIAlertAction actionWithTitle:@"Cancel"
-                style:UIAlertActionStyleCancel handler:nil]];
-            [confirm addAction:[UIAlertAction actionWithTitle:@"Attempt"
-                style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-                    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-                        gp_trajectory_attempt(YES);
-                    });
-                }]];
-            [self presentViewController:confirm animated:YES completion:nil];
+            // Defensively reject stale/invoked actions even though the UI row
+            // has been removed. The prior RemoteCall inspection crashed 8 Ball.
+            log_user("[GP-TRAJECTORY] Memory patch disabled pending safe compatibility analysis.\n");
             return;
         } else if ([action isEqualToString:@"quickloader-open-sources"]) {
             [self selectBottomTabNamed:@"Sources"];
