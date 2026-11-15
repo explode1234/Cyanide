@@ -14093,9 +14093,15 @@ static void gp_trajectory_attempt(BOOL permitWrite) {
         int matches = 0;
         int targetPid = 0;
         uint64_t targetProc = 0;
+        char targetComm[32] = {0};
         NSString *identifiedVersion = nil;
         for (int i = 0; i < n; i++) {
-            if (strcmp(entries[i].name, "MessagesExtension") != 0) continue;
+            // The kernel's comm field can truncate names (including
+            // MessagesExtension). Match the available prefix, then verify
+            // the full executable path and its actual bundle identifier.
+            size_t commLen = strnlen(entries[i].name, sizeof(entries[i].name));
+            if (commLen < 12 || commLen > strlen("MessagesExtension") ||
+                strncmp(entries[i].name, "MessagesExtension", commLen) != 0) continue;
             char processPath[4096] = {0};
             int bytes = proc_pidpath(entries[i].pid, processPath, sizeof(processPath));
             if (bytes <= 0 || processPath[0] != '/') {
@@ -14116,6 +14122,8 @@ static void gp_trajectory_attempt(BOOL permitWrite) {
             ++matches;
             targetPid = entries[i].pid;
             targetProc = entries[i].kproc;
+            strncpy(targetComm, entries[i].name, sizeof(targetComm) - 1);
+            targetComm[sizeof(targetComm) - 1] = '\0';
             identifiedVersion = [bundle objectForInfoDictionaryKey:@"CFBundleShortVersionString"];
         }
         free(entries);
@@ -14125,15 +14133,15 @@ static void gp_trajectory_attempt(BOOL permitWrite) {
         }
         // Ensure RemoteCall's process-name selector resolves to the EXACT
         // process instance we verified; do not redirect to another extension.
-        if (proc_find_by_name("MessagesExtension") != targetProc) {
+        if (!targetComm[0] || proc_find_by_name(targetComm) != targetProc) {
             log_user("[GP-TRAJECTORY] Process selection ambiguous or changed. Abort.\n");
             return;
         }
-        log_user("[GP-TRAJECTORY] Verified bundle ID, PID=%d version=%s.\n",
-                 targetPid, identifiedVersion ? identifiedVersion.UTF8String : "(unknown)");
+        log_user("[GP-TRAJECTORY] Verified bundle ID, PID=%d comm=%s version=%s.\n",
+                 targetPid, targetComm, identifiedVersion ? identifiedVersion.UTF8String : "(unknown)");
 
         RemoteCallSession *session = [[RemoteCallSession alloc]
-            initWithProcess:@"MessagesExtension" useMigFilterBypass:NO
+            initWithProcess:[NSString stringWithUTF8String:targetComm] useMigFilterBypass:NO
             firstExceptionTimeoutMS:5000];
         if (!session) {
             log_user("[GP-TRAJECTORY] Could not open RemoteCall session.\n");
@@ -14144,7 +14152,7 @@ static void gp_trajectory_attempt(BOOL permitWrite) {
             uint64_t currentProc = 0;
             BOOL sameTarget = (session.pid == targetPid &&
                 procmgr_identity_for_pid(targetPid, currentComm, sizeof(currentComm), &currentProc) == 0 &&
-                strcmp(currentComm, "MessagesExtension") == 0 &&
+                strcmp(currentComm, targetComm) == 0 &&
                 currentProc == targetProc);
             if (!sameTarget) {
                 log_user("[GP-TRAJECTORY] Session PID/process identity changed; refusing patch.\n");
