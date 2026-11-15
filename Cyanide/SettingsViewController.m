@@ -14141,18 +14141,38 @@ static void gp_trajectory_inspect_readonly(void) {
                  bundleVerified ? "bundle-ID verified" : "vnode path only (UNVERIFIED)",
                  exe ? exe.UTF8String : "(unavailable)");
 
-        // Noninvasive on-disk binary accessibility test. Only reads a 4-byte
-        // Mach-O header; does not scan live memory or execute remote code.
-        int fd = exe ? open(exe.fileSystemRepresentation, O_RDONLY) : -1;
-        if (fd < 0) {
-            log_user("[GP-TRAJECTORY] Binary read access denied/unavailable (errno=%d).\n", errno);
-        } else {
+        // Noninvasive, on-disk Mach-O header read only (4 bytes).
+        // Kernel vnode paths may be rooted at /containers rather than
+        // /private/var/containers in the process' filesystem namespace.
+        // Retry canonical filesystem prefixes; never use RemoteCall here.
+        NSMutableArray<NSString *> *readPaths = [NSMutableArray array];
+        if (exe.length) {
+            [readPaths addObject:exe];
+            if ([exe hasPrefix:@"/containers/"]) {
+                [readPaths addObject:[@"/var" stringByAppendingString:exe]];
+                [readPaths addObject:[@"/private/var" stringByAppendingString:exe]];
+            }
+        }
+        BOOL headerReadable = NO;
+        for (NSString *candidatePath in readPaths) {
+            int fd = open(candidatePath.fileSystemRepresentation, O_RDONLY);
+            if (fd < 0) {
+                int openError = errno;
+                log_user("[GP-TRAJECTORY] Binary open failed errno=%d path=%s\n",
+                         openError, candidatePath.UTF8String);
+                continue;
+            }
             uint32_t magic = 0;
             ssize_t count = read(fd, &magic, sizeof(magic));
+            int readError = count < 0 ? errno : 0;
             close(fd);
-            log_user("[GP-TRAJECTORY] On-disk binary header bytes=%zd magic=0x%08x (read-only).\n",
-                     count, magic);
+            headerReadable = (count == (ssize_t)sizeof(magic));
+            log_user("[GP-TRAJECTORY] Binary header bytes=%zd magic=0x%08x errno=%d path=%s\n",
+                     count, magic, readError, candidatePath.UTF8String);
+            break;
         }
+        if (!headerReadable)
+            log_user("[GP-TRAJECTORY] No readable binary header via app filesystem; cannot infer compatibility.\n");
     }
     free(entries);
     if (matches != 1 || !targetProc) {
