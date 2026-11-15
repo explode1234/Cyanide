@@ -14388,6 +14388,8 @@ static void gp_live_identify_mmove(uint64_t map, uint64_t imageStart,
                     uint32_t roFlags = 0;
                     if (!gp_meta_copy(map, ps, ro, &roFlags, 4) ||
                         !gp_meta_copy(map, ps, ro + 32, &ml, 8)) continue;
+                    // Metaclasses share class names but mMove is an instance method.
+                    if (roFlags & 1U) continue; // RO_META
                     // Ignore invalid zero/misaligned method-list pointers.
                     ml = gp_meta_ptr(ml) & ~3ULL;
                     if (!ml || (ml & 3)) continue;
