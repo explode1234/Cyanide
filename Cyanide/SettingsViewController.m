@@ -14263,6 +14263,123 @@ static uint64_t gp_meta_find_string(uint64_t map, uint64_t ps,
     return 0;
 }
 
+// Verify pool mMove boundaries using the image's own LC_FUNCTION_STARTS
+// linker metadata. This is a conservative CHECK, not proof of runtime behavior.
+// No boundary from a neighboring ObjC method, arbitrary size guess, or opcode
+// proximity is accepted. Fail closed if metadata is absent or inconsistent.
+static void gp_meta_check_function_bounds(uint64_t map, uint64_t ps,
+                                           uint64_t imageStart,
+                                           GPMetadataSection textSect,
+                                           uint64_t fsAddress, uint32_t fsSize,
+                                           const uint64_t methods[3],
+                                           const uint64_t *matches, int nMatches) {
+    const char *names[3] = {"PoolScene", "PoolScene2", "PoolScene3"};
+    uint64_t nextStart[3] = {0}, exactStart[3] = {0};
+    if (!fsAddress || fsSize == 0 || fsSize > 0x20000 ||
+        !textSect.address || textSect.size > 0x2000000ULL) {
+        log_user("[GP-BOUND] LC_FUNCTION_STARTS or __text missing/oversized; boundary UNKNOWN.\n");
+        return;
+    }
+    uint8_t *data = malloc(fsSize);
+    if (!data) return;
+    if (!gp_meta_copy(map, ps, fsAddress, data, fsSize)) {
+        free(data);
+        log_user("[GP-BOUND] Cannot read LC_FUNCTION_STARTS from live __LINKEDIT; boundary UNKNOWN.\n");
+        return;
+    }
+    size_t cursor = 0;
+    uint64_t runningOffset = 0, previous = 0;
+    int functionCount = 0;
+    BOOL terminated = NO, invalid = NO;
+    while (cursor < fsSize && functionCount < 200000) {
+        uint64_t delta = 0;
+        unsigned shift = 0;
+        BOOL decoded = NO;
+        for (int j = 0; j < 10 && cursor < fsSize; ++j) {
+            uint8_t octet = data[cursor++];
+            uint64_t part = (uint64_t)(octet & 0x7f);
+            if (shift >= 64 || part > (UINT64_MAX >> shift)) {
+                invalid = YES;
+                break;
+            }
+            delta |= part << shift;
+            if (!(octet & 0x80)) { decoded = YES; break; }
+            shift += 7;
+        }
+        if (invalid || !decoded) { invalid = YES; break; }
+        if (delta == 0) { terminated = YES; break; }
+        if (runningOffset > UINT64_MAX - delta ||
+            imageStart > UINT64_MAX - runningOffset - delta) {
+            invalid = YES; break;
+        }
+        runningOffset += delta;
+        uint64_t fstart = imageStart + runningOffset;
+        if (functionCount && fstart <= previous) { invalid = YES; break; }
+        previous = fstart;
+        ++functionCount;
+        // We only trust functions explicitly recorded inside __TEXT,__text.
+        if (!gp_meta_in_section(textSect, fstart, 4)) continue;
+        for (int k = 0; k < 3; ++k) {
+            if (!methods[k]) continue;
+            if (fstart == methods[k]) exactStart[k] = fstart;
+            if (fstart > methods[k] &&
+                (!nextStart[k] || fstart < nextStart[k]))
+                nextStart[k] = fstart;
+        }
+    }
+    free(data);
+    log_user("[GP-BOUND] Function starts parsed=%d terminated=%d invalid=%d.\n",
+             functionCount, terminated, invalid);
+    if (invalid || !terminated || !functionCount) {
+        log_user("[GP-BOUND] Incomplete function-starts metadata; all boundaries UNKNOWN.\n");
+        return;
+    }
+    for (int k = 0; k < 3; ++k) {
+        if (!methods[k] || exactStart[k] != methods[k] ||
+            !nextStart[k] || nextStart[k] <= methods[k]) {
+            log_user("[GP-BOUND] %s::mMove has no exact start/next function start; UNKNOWN.\n",
+                     names[k]);
+            continue;
+        }
+        uint64_t size = nextStart[k] - methods[k];
+        if (size > 0x4000ULL || (size & 3) ||
+            !gp_meta_in_section(textSect, methods[k], (size_t)size)) {
+            log_user("[GP-BOUND] %s::mMove invalid/oversized bounded interval (%llu bytes); UNKNOWN.\n",
+                     names[k], (unsigned long long)size);
+            continue;
+        }
+        uint8_t *body = malloc((size_t)size);
+        if (!body) continue;
+        if (!gp_meta_copy(map, ps, methods[k], body, (size_t)size)) {
+            free(body);
+            log_user("[GP-BOUND] %s::mMove body not fully readable; UNKNOWN.\n",
+                     names[k]);
+            continue;
+        }
+        int opcodeCount = 0;
+        uint64_t opcodeAt = 0;
+        for (size_t i = 0; i + 4 <= (size_t)size; i += 4) {
+            uint32_t insn = 0;
+            memcpy(&insn, body + i, 4);
+            if (insn == 0x52a84e08U) {
+                ++opcodeCount;
+                opcodeAt = methods[k] + i;
+            }
+        }
+        free(body);
+        int matchingCandidate = 0;
+        if (opcodeCount == 1)
+            for (int i = 0; i < nMatches && i < 8; ++i)
+                if (matches[i] == opcodeAt) matchingCandidate = i + 1;
+        log_user("[GP-BOUND] %s::mMove range=[0x%llx,0x%llx) bytes=%llu opcodeCount=%d C%d status=%s.\n",
+                 names[k], (unsigned long long)methods[k],
+                 (unsigned long long)nextStart[k], (unsigned long long)size,
+                 opcodeCount, matchingCandidate,
+                 (opcodeCount == 1 && matchingCandidate) ?
+                    "BOUNDARY+OPCODE MATCH (NO PATCH)" : "INCONCLUSIVE (NO PATCH)");
+    }
+}
+
 static void gp_live_identify_mmove(uint64_t map, uint64_t imageStart,
                                    uint64_t ps, const uint64_t *matches, int nMatches) {
     struct mach_header_64 mh = {0};
@@ -14300,14 +14417,28 @@ static void gp_live_identify_mmove(uint64_t map, uint64_t imageStart,
         at += lc->cmdsize;
     }
     GPMetadataSection className = {0}, methodName = {0}, constSections[8] = {{0}};
+    GPMetadataSection textSect = {0};
+    uint64_t linkVmaddr = 0, linkFileoff = 0, linkFilesize = 0;
+    uint32_t functionDataoff = 0, functionDatasize = 0;
     int constCount = 0;
     at = 0;
     if (haveSlide) for (uint32_t i = 0; i < mh.ncmds; ++i) {
         if (at + sizeof(struct load_command) > mh.sizeofcmds) break;
         const struct load_command *lc = (const struct load_command *)(cmds + at);
         if (lc->cmdsize < sizeof(*lc) || lc->cmdsize > mh.sizeofcmds - at) break;
+        if (lc->cmd == LC_FUNCTION_STARTS &&
+            lc->cmdsize >= sizeof(struct linkedit_data_command)) {
+            const struct linkedit_data_command *fs = (const struct linkedit_data_command *)lc;
+            functionDataoff = fs->dataoff;
+            functionDatasize = fs->datasize;
+        }
         if (lc->cmd == LC_SEGMENT_64 && lc->cmdsize >= sizeof(struct segment_command_64)) {
             const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            if (strncmp(seg->segname, "__LINKEDIT", 16) == 0) {
+                linkVmaddr = seg->vmaddr;
+                linkFileoff = seg->fileoff;
+                linkFilesize = seg->filesize;
+            }
             if (seg->nsects <= 128 &&
                 (size_t)seg->nsects * sizeof(struct section_64) <=
                 lc->cmdsize - sizeof(*seg)) {
@@ -14317,6 +14448,9 @@ static void gp_live_identify_mmove(uint64_t map, uint64_t imageStart,
                     const struct section_64 *sect = &sections[j];
                     if (sect->size == 0 || sect->addr > UINT64_MAX - slide) continue;
                     GPMetadataSection view = {sect->addr + slide, sect->size};
+                    if (strncmp(sect->sectname, "__text", 16) == 0 &&
+                        strncmp(seg->segname, "__TEXT", 16) == 0)
+                        textSect = view;
                     if (strncmp(sect->sectname, "__objc_classname", 16) == 0)
                         className = view;
                     else if (strncmp(sect->sectname, "__objc_methname", 16) == 0)
@@ -14466,6 +14600,20 @@ static void gp_live_identify_mmove(uint64_t map, uint64_t imageStart,
                          i+1, (unsigned long long)(matches[i]-methods[k]), targets[k]);
         }
     }
+    // LC_FUNCTION_STARTS gives true linker function boundaries, unlike the
+    // earlier proximity-only check. If unavailable, report UNKNOWN and stop.
+    uint64_t fsAddress = 0;
+    if (linkVmaddr <= UINT64_MAX - slide &&
+        functionDataoff >= linkFileoff &&
+        (uint64_t)functionDataoff - linkFileoff <= linkFilesize &&
+        functionDatasize <= linkFilesize - ((uint64_t)functionDataoff - linkFileoff)) {
+        uint64_t fileDelta = (uint64_t)functionDataoff - linkFileoff;
+        if (linkVmaddr + slide <= UINT64_MAX - fileDelta)
+            fsAddress = linkVmaddr + slide + fileDelta;
+    }
+    gp_meta_check_function_bounds(map, ps, imageStart, textSect,
+                                  fsAddress, functionDatasize,
+                                  methods, matches, nMatches);
     log_user("[GP-META] Analysis complete; no patch and no remote execution.\n");
 }
 
