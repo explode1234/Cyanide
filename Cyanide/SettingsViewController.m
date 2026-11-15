@@ -14292,9 +14292,26 @@ static void gp_trajectory_live_signature_probe(void) {
             memcpy(&instruction, b + o, 4);
             if (instruction == 0x52a84e08U) {
                 ++needleMatches;
-                if (needleMatches <= 8)
-                    log_user("[GP-LIVE] GameSeagull historical instruction at 0x%llx (UNVERIFIED method).\n",
-                             (unsigned long long)(addr + o));
+                if (needleMatches <= 8) {
+                    // This MOVZ instruction constructs the bit pattern 0x42700000
+                    // (60.0f), so it can appear in unrelated game code too.
+                    // Save nearby instructions for OFFLINE review. Copy only
+                    // from the already-mapped page; never write or remote-execute.
+                    log_user("[GP-LIVE] Candidate %d at 0x%llx (UNVERIFIED method; 60.0f opcode).\n",
+                             needleMatches, (unsigned long long)(addr + o));
+                    if (o >= 16 && (pageSize - o) >= 20) {
+                        uint32_t before[4] = {0}, after[4] = {0};
+                        memcpy(before, b + o - 16, sizeof(before));
+                        memcpy(after, b + o + 4, sizeof(after));
+                        log_user("[GP-LIVE] C%d before[-16..-4]: %08x %08x %08x %08x\n",
+                                 needleMatches, before[0], before[1], before[2], before[3]);
+                        log_user("[GP-LIVE] C%d after[+4..+16]: %08x %08x %08x %08x\n",
+                                 needleMatches, after[0], after[1], after[2], after[3]);
+                    } else {
+                        log_user("[GP-LIVE] C%d context crosses page boundary; not copied.\n",
+                                 needleMatches);
+                    }
+                }
             }
         }
         vm_shmem_release(&pg, pageSize);
