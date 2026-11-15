@@ -801,6 +801,29 @@ static bool pm_exe_path_for_proc(uint64_t proc, char *buf, size_t buflen) {
     return buf[0] != '\0';
 }
 
+// Diagnostics ONLY: a sandboxed proc_pidpath() can return EPERM for another
+// extension even when the process's kernel proc and executable vnode are live.
+// Return a best-effort path without expanding any permissions or writing memory.
+bool procmgr_exe_path_for_entry(uint64_t kproc, int pid, char *out, size_t outlen) {
+    if (!out || outlen < 2) return false;
+    out[0] = '\0';
+    if (pid <= 0 || !procmgr_is_kern_ptr(kproc) ||
+        !kexploit_krw_session_active() || !ksafe_available() ||
+        !off_proc_p_pid || !off_proc_p_textvp) return false;
+    if (!kaddr_is_mapped(kproc + off_proc_p_pid, sizeof(uint32_t)) ||
+        !kaddr_is_mapped(kproc + off_proc_p_textvp, sizeof(uint64_t))) return false;
+
+    krw_set_nonfatal(true);
+    uint64_t errorsBefore = krw_op_error_count();
+    bool ok = ((int)kread32(kproc + off_proc_p_pid) == pid);
+    if (ok) ok = pm_exe_path_for_proc(kproc, out, outlen);
+    if (ok) ok = ((int)kread32(kproc + off_proc_p_pid) == pid);
+    ok = ok && (krw_op_error_count() == errorsBefore);
+    krw_set_nonfatal(false);
+    if (!ok) out[0] = '\0';
+    return ok;
+}
+
 static int pm_classify_path(const char *path) {
     if (strstr(path, "/containers/Bundle/Application/")) return PM_KIND_APP;   // third-party apps
     if (strncmp(path, "/Applications/", 14) == 0) return PM_KIND_APP;          // system apps
