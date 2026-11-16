@@ -14381,6 +14381,7 @@ static void gp_meta_check_function_bounds(uint64_t map, uint64_t ps,
         // existing user protection bits only. This cannot grant permissions,
         // does not remap the target, and never writes to game memory.
         if (opcodeCount == 1 && matchingCandidate) {
+            const char *sceneName = names[k];
             __block BOOL foundEntry = NO;
             vm_map_iterate_entries(map, ^(uint64_t start, uint64_t end,
                                           uint64_t entry, BOOL *stop) {
@@ -14390,22 +14391,22 @@ static void gp_meta_check_function_bounds(uint64_t map, uint64_t ps,
                 struct VMEntryInfo info = {0};
                 if (!vm_map_entry_info(entry, &info)) {
                     log_user("[GP-PREFLIGHT] %s C%d VM entry unreadable; NO WRITE.\n",
-                             names[k], matchingCandidate);
+                             sceneName, matchingCandidate);
                     return;
                 }
                 BOOL codeReadable = (info.protection & VM_PROT_READ) != 0;
                 BOOL codeWritable = (info.protection & VM_PROT_WRITE) != 0;
                 BOOL codeExecutable = (info.protection & VM_PROT_EXECUTE) != 0;
                 log_user("[GP-PREFLIGHT] %s C%d vmprot=0x%x R=%d W=%d X=%d; sharedObject=%d; NO WRITE.\n",
-                         names[k], matchingCandidate, info.protection,
+                         sceneName, matchingCandidate, info.protection,
                          codeReadable, codeWritable, codeExecutable,
                          info.object != 0);
                 if (!codeWritable) {
                     log_user("[GP-PREFLIGHT] %s code page not writable; do NOT attempt blind memcpy/patch.\n",
-                             names[k]);
+                             sceneName);
                 } else {
                     log_user("[GP-PREFLIGHT] %s appears writable, but target patch behavior is UNPROVEN.\n",
-                             names[k]);
+                             sceneName);
                 }
             });
             if (!foundEntry)
