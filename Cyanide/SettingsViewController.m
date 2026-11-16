@@ -14941,6 +14941,11 @@ static void gp_trajectory_live_signature_probe(void) {
                           @"title": @"Inspect GamePigeon Process (Read-only)" }];
     [rows addObject:@{ @"kind": @"button", @"action": @"gp-live-probe",
                           @"title": @"Probe Live GamePigeon Code (Experimental)" }];
+    [rows addObject:@{ @"kind": @"button", @"action": @"gp-guide-show",
+                          @"title": @"TEST Manual 8 Ball Screen Guideline" }];
+    [rows addObject:@{ @"kind": @"button", @"action": @"gp-guide-hide",
+                          @"title": @"Hide Manual Screen Guideline" }];
+
 
     if (filename) {
         [rows addObject:@{ @"kind": @"button", @"action": @"quickloader-clear",
@@ -21149,6 +21154,65 @@ void cyanide_present_contact(UIViewController *host)
         } else if ([action isEqualToString:@"gp-trajectory-inspect"]) {
             dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
                 gp_trajectory_inspect_readonly();
+            });
+            return;
+        } else if ([action isEqualToString:@"gp-guide-show"]) {
+            UIAlertController *alert = [UIAlertController
+                alertControllerWithTitle:@"Manual Screen Guide (Experimental)"
+                message:@"Draw a click-through white line above the screen via SpringBoard. This is NOT an automatic 8 Ball trajectory predictor. Coordinates are screen points; origin is the upper-left. SpringBoard RemoteCall can crash or restart the UI. A Hide button is provided; reboot also clears it."
+                preferredStyle:UIAlertControllerStyleAlert];
+            NSArray<NSString *> *defaults = @[@"140", @"310", @"-10", @"500"];
+            NSArray<NSString *> *placeholders = @[@"Start X", @"Start Y", @"Angle in degrees", @"Length in points"];
+            for (NSUInteger i = 0; i < 4; i++) {
+                NSString *initial = defaults[i], *placeholder = placeholders[i];
+                [alert addTextFieldWithConfigurationHandler:^(UITextField *field) {
+                    field.placeholder = placeholder;
+                    field.text = initial;
+                    field.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
+                }];
+            }
+            __weak UIAlertController *weakAlert = alert;
+            [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+            [alert addAction:[UIAlertAction actionWithTitle:@"Show Test Line"
+                style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+                    (void)a;
+                    NSArray<UITextField *> *fields = weakAlert.textFields;
+                    if (fields.count != 4) return;
+                    double x = fields[0].text.doubleValue;
+                    double y = fields[1].text.doubleValue;
+                    double degrees = fields[2].text.doubleValue;
+                    double length = fields[3].text.doubleValue;
+                    if (!isfinite(x) || !isfinite(y) || !isfinite(degrees) || !isfinite(length) ||
+                        x < 0 || x > 2000 || y < 0 || y > 2000 ||
+                        degrees < -360 || degrees > 360 || length < 20 || length > 1400) {
+                        log_user("[GP-GUIDE] Invalid screen guide inputs; no changes made.\n");
+                        return;
+                    }
+                    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                        @synchronized (settings_rc_lock()) {
+                            if (!kexploit_krw_ready() ||
+                                !settings_ensure_springboard_remote_call_locked()) {
+                                log_user("[GP-GUIDE] Could not open SpringBoard channel; aborted.\n");
+                                return;
+                            }
+                            BOOL ok = statbar_gp_guide_apply_in_session(x, y, degrees, length);
+                            log_user("[GP-GUIDE] Manual test line request %s. No GamePigeon patch.\n",
+                                     ok ? "applied" : "failed/uncertain");
+                        }
+                    });
+                }]];
+            [self presentViewController:alert animated:YES completion:nil];
+            return;
+        } else if ([action isEqualToString:@"gp-guide-hide"]) {
+            dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                @synchronized (settings_rc_lock()) {
+                    if (!kexploit_krw_ready() ||
+                        !settings_ensure_springboard_remote_call_locked()) {
+                        log_user("[GP-GUIDE] Cannot access SpringBoard to hide line.\n");
+                        return;
+                    }
+                    statbar_gp_guide_remove_in_session();
+                }
             });
             return;
         } else if ([action isEqualToString:@"gp-live-probe"]) {
