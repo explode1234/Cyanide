@@ -6,6 +6,7 @@ on:
     branches:
       - gp-trajectory-experiment
       - gp-live-memory-probe
+      - gp-screen-guide-overlay
 
 jobs:
   build:
