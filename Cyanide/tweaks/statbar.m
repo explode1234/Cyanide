@@ -850,6 +850,133 @@ static bool statbar_install_overlay(NSString *text, bool showNet, bool showCPU, 
     return true;
 }
 
+// Manual proof-of-concept extended guideline, drawn in SpringBoard instead
+// of the GamePigeon executable. It does NOT track the 8 Ball cue automatically,
+// alter game physics, or modify any GamePigeon process memory.
+// The UIWindow is click-through, non-persistent, and separately removable.
+static const uint64_t kGPGuideLineTag = 998271;
+
+static uint64_t gp_guide_find_app_and_window(uint64_t *appOut) {
+    if (appOut) *appOut = 0;
+    uint64_t cls = r_class("UIApplication");
+    if (!r_is_objc_ptr(cls)) return 0;
+    uint64_t app = r_msg2_main(cls, "sharedApplication", 0, 0, 0, 0);
+    if (!r_is_objc_ptr(app)) return 0;
+    if (appOut) *appOut = app;
+    uint64_t assocKey = r_sel("cyanideGPGuideWindow");
+    if (!assocKey) return 0;
+    return r_dlsym_call(R_TIMEOUT, "objc_getAssociatedObject",
+                        app, assocKey, 0, 0, 0, 0, 0, 0);
+}
+
+bool statbar_gp_guide_apply_in_session(double x, double y, double degrees, double length)
+{
+    if (!isfinite(x) || !isfinite(y) || !isfinite(degrees) || !isfinite(length) ||
+        x < 0 || y < 0 || x > 2000 || y > 2000 ||
+        degrees < -360 || degrees > 360 || length < 20 || length > 1400) {
+        printf("[GP-GUIDE] Invalid coordinates/angle/length; not applied.\n");
+        return false;
+    }
+    uint64_t app = 0;
+    uint64_t win = gp_guide_find_app_and_window(&app);
+    if (!r_is_objc_ptr(app)) {
+        printf("[GP-GUIDE] SpringBoard UIApplication not available.\n");
+        return false;
+    }
+    uint64_t key = r_sel("cyanideGPGuideWindow");
+    if (!key) return false;
+
+    uint64_t colorCls = r_class("UIColor");
+    uint64_t clearColor = r_is_objc_ptr(colorCls)
+        ? r_msg2_main(colorCls, "clearColor", 0, 0, 0, 0) : 0;
+    uint64_t whiteColor = r_is_objc_ptr(colorCls)
+        ? r_msg2_main(colorCls, "whiteColor", 0, 0, 0, 0) : 0;
+    if (!r_is_objc_ptr(clearColor) || !r_is_objc_ptr(whiteColor)) return false;
+
+    uint64_t keyWin = r_msg2_main(app, "keyWindow", 0, 0, 0, 0);
+    if (!r_is_objc_ptr(keyWin)) {
+        printf("[GP-GUIDE] No SpringBoard keyWindow; cannot determine scene.\n");
+        return false;
+    }
+    StatBarLayoutMetrics metrics = statbar_read_layout_metrics(keyWin);
+    double width = metrics.screenWidth, height = metrics.screenHeight;
+    if (!statbar_valid_screen_length(width) || !statbar_valid_screen_length(height)) {
+        printf("[GP-GUIDE] Invalid screen dimensions; refusing overlay.\n");
+        return false;
+    }
+
+    if (!r_is_objc_ptr(win)) {
+        uint64_t scene = r_msg2_main(keyWin, "windowScene", 0, 0, 0, 0);
+        uint64_t windowCls = r_class("UIWindow");
+        if (!r_is_objc_ptr(scene) || !r_is_objc_ptr(windowCls)) return false;
+        uint64_t alloc = r_msg2_main(windowCls, "alloc", 0, 0, 0, 0);
+        win = r_is_objc_ptr(alloc)
+            ? r_msg2_main(alloc, "initWithWindowScene:", scene, 0, 0, 0) : 0;
+        if (!r_is_objc_ptr(win)) return false;
+        r_msg2_main(win, "setBackgroundColor:", clearColor, 0, 0, 0);
+        r_msg2_main(win, "setOpaque:", 0, 0, 0, 0);
+        r_msg2_main(win, "setUserInteractionEnabled:", 0, 0, 0, 0);
+        r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject",
+                     app, key, win, 1, 0, 0, 0, 0);
+    }
+    if (!r_send_rect_main(win, "setFrame:", 0, 0, width, height) ||
+        !r_send_double_main(win, "setWindowLevel:", 999998.0)) return false;
+
+    uint64_t line = r_msg2_main(win, "viewWithTag:", kGPGuideLineTag, 0, 0, 0);
+    if (!r_is_objc_ptr(line)) {
+        uint64_t viewCls = r_class("UIView");
+        if (!r_is_objc_ptr(viewCls)) return false;
+        uint64_t alloc = r_msg2_main(viewCls, "alloc", 0, 0, 0, 0);
+        line = r_is_objc_ptr(alloc) ? r_msg2_main(alloc, "init", 0, 0, 0, 0) : 0;
+        if (!r_is_objc_ptr(line)) return false;
+        r_msg2_main(line, "setTag:", kGPGuideLineTag, 0, 0, 0);
+        r_msg2_main(line, "setBackgroundColor:", whiteColor, 0, 0, 0);
+        r_msg2_main(line, "setUserInteractionEnabled:", 0, 0, 0, 0);
+        r_send_double_main(line, "setAlpha:", 0.85);
+        r_msg2_main(win, "addSubview:", line, 0, 0, 0);
+    }
+
+    // UIKit rotates around the view's center. Pre-place its unrotated frame
+    // so the rotated left endpoint is at (x,y) in SpringBoard screen points.
+    double radians = degrees * M_PI / 180.0;
+    double centerX = x + cos(radians) * length * 0.5;
+    double centerY = y + sin(radians) * length * 0.5;
+    CGAffineTransform identity = CGAffineTransformIdentity;
+    r_msg2_main_raw(line, "setTransform:",
+                    &identity, sizeof(identity), NULL, 0, NULL, 0, NULL, 0);
+    if (!r_last_main_ok()) return false;
+    if (!r_send_rect_main(line, "setFrame:",
+                          centerX - length * 0.5, centerY - 1.5, length, 3.0))
+        return false;
+    CGAffineTransform rotated = CGAffineTransformMakeRotation(radians);
+    r_msg2_main_raw(line, "setTransform:",
+                    &rotated, sizeof(rotated), NULL, 0, NULL, 0, NULL, 0);
+    if (!r_last_main_ok()) return false;
+    r_msg2_main(line, "setHidden:", 0, 0, 0, 0);
+    r_msg2_main(win, "setHidden:", 0, 0, 0, 0);
+    bool ok = r_last_main_ok();
+    printf("[GP-GUIDE] Manual overlay %s at x=%.1f y=%.1f angle=%.1f length=%.1f screen=%.1fx%.1f. Not auto-tracked.\n",
+           ok ? "SHOWN" : "UNCERTAIN", x, y, degrees, length, width, height);
+    return ok;
+}
+
+bool statbar_gp_guide_remove_in_session(void)
+{
+    uint64_t app = 0;
+    uint64_t win = gp_guide_find_app_and_window(&app);
+    if (!r_is_objc_ptr(app)) return false;
+    if (!r_is_objc_ptr(win)) {
+        printf("[GP-GUIDE] No overlay is active.\n");
+        return true;
+    }
+    r_msg2_main(win, "setHidden:", 1, 0, 0, 0);
+    uint64_t key = r_sel("cyanideGPGuideWindow");
+    if (key) r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject",
+                          app, key, 0, 1, 0, 0, 0, 0);
+    printf("[GP-GUIDE] Overlay hidden and released; no GamePigeon changes.\n");
+    return true;
+}
+
 // Recursive walk of the SpringBoard status-bar wrapper subview tree, looking
 // for STUIStatusBarStringView (iOS 17+) / _UIStatusBarStringView (iOS 16).
 // Stops when the first label whose -text contains ":" is found (clock).
