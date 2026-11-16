@@ -15,4 +15,11 @@ bool statbar_apply_in_session(bool celsius, bool showNet, bool showCPU, bool sho
 bool statbar_stop_in_session(void);
 void statbar_forget_remote_state(void);
 
+
+// Experimental, manual screen guideline drawn in SpringBoard (not GamePigeon).
+// Coordinates are in iPad screen points; angle is degrees clockwise.
+// The overlay is click-through and can be removed without rebooting.
+bool statbar_gp_guide_apply_in_session(double x, double y, double angleDegrees, double lengthPoints);
+bool statbar_gp_guide_remove_in_session(void);
+
 #endif
